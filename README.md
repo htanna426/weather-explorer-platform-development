@@ -117,6 +117,129 @@ src/
     index.ts                                    # Drizzle/pg client
 ```
 
+## Design Approach
+
+### Overall Philosophy
+
+The platform is built around three guiding principles: **separation of concerns**, **fail-fast validation**, and **backend-agnostic storage**. Every layer of the application has a single, well-defined responsibility, and cross-cutting concerns (logging, rate limiting, error handling) are composed via middleware rather than duplicated across handlers.
+
+### Architectural Layers
+
+The application follows a layered architecture where each layer depends only on the one below it:
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Components (React UI)                              │
+│  DashboardShell, WeatherForm, Charts, ExportMenu    │
+├─────────────────────────────────────────────────────┤
+│  Hooks (TanStack Query)                             │
+│  use-weather-queries, use-system-queries            │
+├─────────────────────────────────────────────────────┤
+│  API Client (Axios)                                 │
+│  Typed HTTP client with error normalization         │
+├─────────────────────────────────────────────────────┤
+│  Route Handlers (Next.js App Router)                │
+│  Thin orchestrators wrapped with withApiHandler     │
+├─────────────────────────────────────────────────────┤
+│  Middleware (Cross-cutting)                         │
+│  Logging, rate limiting, CORS, error handling       │
+├─────────────────────────────────────────────────────┤
+│  Services (Business Logic)                          │
+│  WeatherDatasetService, OpenMeteoService, Analytics │
+├─────────────────────────────────────────────────────┤
+│  Repositories (Data Access)                         │
+│  Drizzle-powered CRUD + aggregation queries         │
+├─────────────────────────────────────────────────────┤
+│  Storage Providers (Strategy Pattern)               │
+│  Local FS │ PostgreSQL BYTEA │ AWS S3               │
+└─────────────────────────────────────────────────────┘
+```
+
+Route handlers are deliberately thin — they validate input, delegate to a service, and return a response. All business logic lives in the service layer, making it testable in isolation without HTTP overhead.
+
+### Design Patterns in Practice
+
+| Pattern | Where | Why |
+|---|---|---|
+| **Strategy** | `storage/` — `WeatherStorageProvider` interface with three concrete implementations | Swap storage backends (local, database, S3) via environment variables with zero code changes |
+| **Factory** | `storage-factory.ts` — provider selection with priority chain (S3 → Database → Local) | Centralizes the instantiation decision; caches the result for the process lifetime |
+| **Repository** | `repositories/weather-file-repository.ts` — all Drizzle queries encapsulated here | Services depend on a clean data-access API, not raw SQL or ORM internals |
+| **DTO / Mapper** | `types/api.ts` + `services/dataset-mapper.ts` — internal rows never leak to the API | The database schema can evolve independently of the public API contract |
+| **Middleware Composition** | `middleware/api-handler.ts` — `withApiHandler()` wraps every route | Logging, rate limiting, CORS, and error mapping are applied uniformly without repetition |
+| **Smart Cache** | `weather-dataset-service.ts` — deterministic request hash (SHA-256 of lat/lon/dates) | Identical requests are served instantly from the database, avoiding redundant upstream API calls |
+
+### Data Flow: Storing Weather Data
+
+The end-to-end flow for a `POST /api/weather/store` request illustrates how the layers interact:
+
+```
+Client Request
+    │
+    ▼
+withApiHandler middleware ──► Rate limit check, request ID, logging
+    │
+    ▼
+Route handler ──► Zod schema validation (shared with client)
+    │
+    ▼
+WeatherDatasetService.storeWeatherData()
+    │
+    ├─► Compute requestHash (SHA-256 of lat, lon, startDate, endDate)
+    │
+    ├─► Repository: findByRequestHash() ──► Cache hit?
+    │       │                                  │
+    │       │  YES ◄───────────────────────────┘
+    │       │  Increment cacheHits, return cached dataset (200)
+    │       │
+    │       │  NO
+    │       ▼
+    ├─► OpenMeteoService.fetchHistoricalWeather()
+    │       │  Build URL → fetch with timeout → retry with
+    │       │  exponential backoff + jitter on 5xx/429
+    │       │  Fail fast on 4xx client errors
+    │       ▼
+    ├─► Analytics: compute daily rows + summary statistics
+    │
+    ├─► Compress payload (gzip) + compute contentHash (SHA-256)
+    │
+    ├─► StorageProvider.putObject() ──► Upload to active backend
+    │
+    └─► Repository.create() ──► Persist metadata + denormalized analytics
+            │
+            ▼
+    Return new dataset (201)
+```
+
+### Frontend Architecture
+
+The frontend is a single-page dashboard built with React 19 and organized into four tabs (Overview, Fetch Data, Datasets, API & Health). Key frontend decisions:
+
+- **TanStack React Query** manages all server state — caching, background refetching, and optimistic updates. Components never call `fetch` directly; they consume typed hooks (`useStoreWeather`, `useWeatherFiles`, `useDashboardStats`).
+- **Shared validation schemas** (Zod) are used on both the client (via `react-hook-form` + `zodResolver`) and the server (via `schema.parse()`), so validation rules can never drift between layers.
+- **Recharts** renders temperature line/area charts, and **Framer Motion** provides subtle enter/exit animations on cards and drawers.
+- **Leaflet + React-Leaflet** powers the interactive map picker, letting users click to select coordinates instead of typing them manually.
+
+### Error Handling Strategy
+
+Errors are classified into three categories, each mapped to an appropriate HTTP status code:
+
+| Category | Class | HTTP Status | Example |
+|---|---|---|---|
+| Validation errors | `ZodError` | `422` | Invalid coordinates, future dates, range > 31 days |
+| Application errors | `AppError` / `NotFoundError` / `UpstreamServiceError` | `404`, `502`, etc. | Dataset not found, Open-Meteo unavailable |
+| Unexpected errors | Any unhandled `Error` | `500` | Bugs, infrastructure failures |
+
+Every error response includes a machine-readable `code`, a human-readable `message`, optional `details`, and an `X-Request-Id` header for tracing.
+
+### Configuration & Fail-Fast Validation
+
+All environment variables are parsed and validated **once at module load time** using a Zod schema in `src/core/config.ts`. This means:
+
+- Missing `DATABASE_URL` crashes the process immediately with a clear error — not 30 minutes later when the first query runs.
+- `STORAGE_PROVIDER=local` is rejected in production, preventing silent failures on Vercel's ephemeral filesystem.
+- Numeric values (`OPEN_METEO_TIMEOUT_MS`, `RATE_LIMIT_MAX_REQUESTS`) are coerced and range-checked.
+- Nothing else in the codebase reads `process.env` directly — all configuration flows through the typed `config` object.
+
 ### Key Design Decisions
 
 - **Separation of metadata and blobs.** The `weather_datasets` PostgreSQL table stores queryable metadata (coordinates, dates, precomputed analytics) while the raw JSON payload is gzip-compressed and pushed to an object storage backend. This mirrors how a real climate-data platform separates "hot" queryable metadata from "cold" bulk blobs.
